@@ -18,7 +18,7 @@ Shutdown the whole unit as required from the controller.
 I auto start this on the Pi Zero with the following systemd service:/
 
 
-[Unit]/
+[Unit]\
 Description=LED control service/
 After=multi-user.target/
 /
