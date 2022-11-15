@@ -19,13 +19,13 @@ I auto start this on the Pi Zero with the following systemd service:/
 
 
 [Unit]\
-Description=LED control service/
-After=multi-user.target/
-/
-[Service]/
-ExecStart=/usr/bin/python3 /home/pi/PIZW_LED_CTRL.py/
-User=root/
-/
-[Install]/
-WantedBy=multi-user.target/
+Description=LED control service\
+After=multi-user.target\
+\
+[Service]\
+ExecStart=/usr/bin/python3 /home/pi/PIZW_LED_CTRL.py\
+User=root\
+\
+[Install]\
+WantedBy=multi-user.target\
 
