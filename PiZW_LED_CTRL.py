@@ -1,6 +1,7 @@
 import logging
 import socket
 import select
+import sys
 import time
 import platform
 import threading
@@ -13,24 +14,28 @@ This code can be run on an intel machine for test and development or on a RPizer
 If its an intel test and development machine then look use dummyGPIO instead of a real one
 Also if running on Intel assume the cougar machine is the host, if not assume it is
 the actual signal controller
+
+The comms code uses UDP - so it doesn't have to have a TCP session open for hours at a time
+It is multi-threaded to achieve the flickering effect, but the comms is simple polling.
+
 """
 
 if platform.machine() == 'armv6l':
     import RPi.GPIO as GPIO
 
     log_fn = '/home/pi/logst.log'
-    THIS_IS_A_PI = True
+    this_is_a_pi = True
     HOST = 'SIGCNTRL.local'
-    #HOST = 'CougarUb.local'
 else:
-    import dummyGPIO as GPIO
+    import dummy_gpio as GPIO
 
     log_fn = '/home/tim/logst.log'
     HOST = 'CougarUb.local'
-    THIS_IS_A_PI = False
+    this_is_a_pi = False
 
 PORT = 65433  # The port used by the server
-VERSION = 3.81
+VERSION = 3.90
+STAY_ALIVE_INTERVAL_IN_MS = 1000
 
 """
 Normal Operation
@@ -41,9 +46,9 @@ Then it will start up LEDs in a defined sequence with flickering for a while whe
 It will then run until it receives a shutdown command from the server at which point the unit will
 shutdown
 
-The power up sequence will allow several leds to be turned on at once - this is controlled by the relevant tuple of tuples
-e.g. nth_power_up_order_tuple = ((25,26), (17,18) , (20,)) - Each of the inner tuples indicates what group of leds to be started
-together
+The power up sequence will allow several leds to be turned on at once - this is controlled by the relevant tuple of 
+tuples e.g. nth_power_up_order_tuple = ((25,26), (17,18) , (20,)) - Each of the inner tuples indicates what group of
+leds to be started together
 
 VERSION 0.4 - original working version written in November 2021
 VERSION 1.0 - Revised version to allow reconnection if Main Signalling Pi Server Drops connection - May 22
@@ -51,17 +56,15 @@ VERSION 2.0 - Rewrite for UDP replacing TCP
 VERSION 3.0 - Rewrite to see if can get to work as a systemctl service unit
 Version 3.72 - Working pretty well and deployed to insert REQ/ACK logic
 VERSION 3.81 - Changed log level
+Version 3.90 - Improved comms code with some tuning, some bug fixes and stat recording
 
 Notes on the Hardware interface boards
 --------------------------------------
-
-
 For mk2 boards there are four 10 way headers, J1-J4
 Headers have a maximum of 8 signal pins, pins 9 and 10 being +Ve rails (The signal pins
 are the returns to GND (depending on the pin state))
 
 21 pins in total
-
 J1 and J2 are duplicated signals.
 J4 has only 5 signals (pins 1-5)
 J1&J2 are GPIOs(BCM labelled) 
@@ -70,6 +73,23 @@ J3 are GPIOS(BCM labelled)
 10,11,12,13,14,15,16,17
 J4 are GPIOS(BCM labelled)
 18,19,20,21,22
+
+Notes on the comms protocol
+--------------------------------------
+Basics of the comms protocol - it's loose UDP so packets likely often get lost
+Once this client end starts it sends stay alive packets every 1 second (see STAY_ALIVE_INTERVAL_IN_MS)
+It starts off sending a HELLO + Version message, Once it receives a message from the server - it changes the
+stay alive packet contents to the last message sent. The only messages sent to the server are stay alive packets
+
+The server however can send a variety of commands to this client - specifically it can say:
+LEDs ON, LEDs OFF or shutdown. (other commands such as individual led commands are possible).
+
+The server can also send a REQ packet if it hasn't received a stay alive recently - this just means send me
+a new stay alive as soon as possible.
+
+All packets in each direction end with a ">>>" followed by a packet count as a string. 
+each direction has it's own count.
+
 """
 
 # The mk1 board has a different set of header pins for led control to the mk2 these lists give the order
@@ -102,33 +122,50 @@ power_up_order_tuple = ()  # filled in by configure routine
 flicker_leds = ()  # filled in by configure routine
 power_up_delays = ()  # filled in by configure routine
 
+# ======================================================================================================
+# Some constants
 MIN_FLICKER_TIME = 5
 MAX_FLICKER_TIME = 500
-
-TESTING = True  # if true then on an end command only return to the command line
+TESTING = False  # if true then on an end command only return to the command line
 # otherwise shutdown the pi
 
+# ======================================================================================================
 # global variables
+
 lock = None  # A lock used to ensure access to led i/o library is not re-entered
-shutdown_flag = False  # A flag to signal form the comms thread to the main thread that its time to go
+shutdown_flag = False  # A flag to signal form the comms thread to the main thread that it's time to go
 exitFlag = False  # A flag to indicate to all threads when we need to quit
 node = platform.node()
 
+# ======================================================================================================
+# Logging setup
+FILE_LOG_LEVEL = logging.INFO
+CONSOLE_LOG_LEVEL = logging.INFO
+fmt = '%(asctime)s.%(msecs)03d - %(funcName)s - %(levelname)s - %(message)s'
+date_fmt = '%H:%M:%S'
+logging.basicConfig(datefmt=date_fmt, format=fmt,
+                    filename=log_fn, level=FILE_LOG_LEVEL)
+logger = logging.getLogger('LightLog')
+logger.setLevel(logging.INFO)
+con_log = logging.StreamHandler(sys.stderr)
+con_log.setLevel(level=CONSOLE_LOG_LEVEL)
+con_log_formatter = logging.Formatter(fmt, date_fmt)
+con_log.setFormatter(con_log_formatter)
+logger.addHandler(con_log)
 
-logging.basicConfig(format='%(asctime)s - %(message)s', filename=log_fn, level=logging.WARNING)
-logging.info('================')
-logging.warning('top of the world v%.2f', VERSION)
-if THIS_IS_A_PI:
-    logging.warning('Its a pi!')
+logger.warning('lights log starting v%.2f', VERSION)
+if this_is_a_pi:
+    logger.warning('Its a pi!')
 else:
-    logging.info('NOT a pi')
-logging.info('platform node name: %s', node)
+    logger.info('NOT a pi')
+logger.info('platform node name: %s', node)
 
+
+# ======================================================================================================
 
 class ClientComms:
     """ A class to managed polled network comms with the light/signal controller
         intended to be instantiated only once
-
     """
 
     def __init__(self):
@@ -136,114 +173,159 @@ class ClientComms:
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         except:
-            logging.info('socket error')
+            logger.info('socket error')
         else:
-            logging.info('no socket error')
+            logger.info('no socket error')
         try:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         except:
-            logging.info('socket options error')
-        else:
-            logging.info('no socket options error')
+            logger.info('socket options error')
 
         self.sock.bind(('', PORT))
-        self.connected = False
-        self.last_stay_alive_packet_time = millis()
-        self.send_packet_count = 0
-        self.last_message = 'Hello client' + str(VERSION)
-        self.reqflag = False
-        self.reqcount = 0
 
-    def stay_alive(self):
-        probe_string = self.last_message  # + str(self.packet_count)
+        self.last_stay_alive_packet_time = millis()
+        self.send_packet_count = 0  # both the number of sent packets and the packet index to add
+        self.last_message = 'Hello client ' + str(VERSION)  # store what was last received, repeat back on next send
+        self.req_flag = False  # true if the last packet received was a REQ packet
+        self.req_packets_count = 0  # record total number of req packets here
+        self.last_rx_packet_index = None  # The last packet index received (None or int)
+        self.good_sequence = 0  # count of packets received in order
+        # self.rx_packet_count = 0            # count of total packets received
+        self.lost_rx_packets = 0  # count of missing RX packets
+        self.restarts = 0  # count of the number of times packets received without increasing index
+        self.total_rx_packet_count = 0  # count of total received packets
+
+    def send_stay_alive_packet(self):
+        """
+        Send Stay Alive packet
+        :return: None
+        """
+        probe_string = self.last_message + '>>>' + str(self.send_packet_count)
         self.send_packet_count += 1
         self.last_stay_alive_packet_time = millis()
-        if self.reqflag:
-            self.reqflag = False
+        if self.req_flag:
+            self.req_flag = False
         try:
             self.sock.sendto(probe_string.encode(), (HOST, PORT))
         except:
-            logging.info('stay alive send fail')
+            logger.info('stay alive send fail')
         else:
-            logging.info('stay alive send ok')
+            logger.info(f'stay alive send ok: {probe_string}')
+        return
 
-    def poll_comms(self):
-        # This looks for incoming commands, takes them form the input socket and actions them
-        # returns a bool which indicates if a req is needed
+    def poll_comms(self) -> bool:
+        """This looks for incoming commands, takes them from the input socket and actions them
+        returns a bool which indicates if the server is REQuesting a stay alive as that will be handled outside this
+        function
+        """
 
         global shutdown_flag
-        global exitFlag     # Flag to say stop flickering please
-        logging.info('polling')
+        global exitFlag  # Flag to say stop flickering please
+        # logger.info('polling')
 
         input_ready, output_ready, except_ready = select.select([0, self.sock], [], [], 0)
         for i in input_ready:
             if i == self.sock:
-                data, addr = i.recvfrom(1024)
-                logging.info('receiving')
-                self.last_message = data.decode()
+                data, (ip, port) = i.recvfrom(1024)
+                packet = data.decode('utf-8')
+                logger.info('receiving')
+                msg_string = self.strip_packet_tail(packet)
+
                 if data:
-                    logging.info('got data')
-                    print(data.decode())
-                    logging.info(data.decode())
+                    logger.info(f'got data{msg_string}')
 
-                    if data.decode() == "REQ":
-                        self.reqflag = True
-                        self.reqcount += 1
-                        print("req received")
+                    if msg_string == "REQ":
+                        self.req_flag = True
+                        self.req_packets_count += 1
+                        logger.info("req received")
 
-
-                    if data.decode() == "ON":
+                    if msg_string == "ON":
                         exitFlag = True
-                        print("All leds switched on")
+                        logger.info("All leds switched on")
                         leds_on()
 
-                    elif data.decode() == "OFF":
-                        print("All leds switched off")
+                    elif msg_string == "OFF":
+                        logger.info("All leds switched off")
                         exitFlag = True
                         leds_off()
 
-                    elif data.decode() == "END":
-                        print("shutdown_message")
+                    elif msg_string == "END":
+                        logger.info("shutdown_message")
                         exitFlag = True
                         shutdown_flag = True
 
-
                     else:
-                        msg_string = data.decode()
+
                         length = len(msg_string)
-                        print("received message", msg_string)
                         if msg_string[0:7] == "ILED_ON" and 7 < length < 10:
                             try:
                                 gpio = int(msg_string[7: length])
-                                print("gpio is:", gpio)
+                                logger.info("gpio is:", gpio)
                                 specific_led_on(gpio)
                             except ValueError:
-                                print("message not well formed")
+                                logger.info("message not well formed")
                         elif msg_string[0:8] == "ILED_OFF" and 8 < length < 11:
                             try:
                                 gpio = int(msg_string[8: length])
-                                print("gpio is:", gpio)
+                                logger.info("gpio is:", gpio)
                                 specific_led_off(gpio)
                             except ValueError:
-                                print("message not well formed")
+                                logger.warning("message not well formed")
                         elif msg_string[0:7] == "HLED_ON" and length == 9:
                             header = int(msg_string[7])
                             pin = int(msg_string[8])
-                            print("hled on message", header, pin)
+                            logger.info("hled on message", header, pin)
                             specific_led_on(convert_to_gpio(header, pin))
                         elif msg_string[0:8] == "HLED_OFF" and length == 10:
                             header = int(msg_string[8])
                             pin = int(msg_string[9])
-                            print("hled off message", header, pin)
+                            logger.info("hled off message", header, pin)
                             specific_led_off(convert_to_gpio(header, pin))
 
-        return self.reqflag
+        return self.req_flag
 
     def close(self):
+        logger.critical(f'Closing comms with stats: '
+                        f'sent {self.send_packet_count},'
+                        f'rxed {self.total_rx_packet_count},'
+                        f'good seq {self.good_sequence},'
+                        f'reqcount {self.req_packets_count},'
+                        f'lost rx {self.lost_rx_packets},'
+                        f'restarts of server {self.restarts}')
         self.sock.close()
+
+    def strip_packet_tail(self, decoded_packet: str) -> str:
+        """The packet should finish with >>>number_string - so find the >>> extract number and check it
+        then return the string without the tail
+        """
+        tail_pos = decoded_packet.rfind('>>>')
+        if tail_pos == -1:
+            logger.error('no packet count on incoming packet')
+            trunc_pkt = decoded_packet
+        else:
+            self.total_rx_packet_count += 1
+            trunc_pkt = decoded_packet[:tail_pos]
+            index = int(decoded_packet[tail_pos + 3:])
+            if trunc_pkt != "REQ":
+                self.last_message = trunc_pkt
+            prev_index = self.last_rx_packet_index
+            self.last_rx_packet_index = index
+            if prev_index:
+                if index - prev_index == 1:
+                    self.good_sequence += 1
+                else:
+                    if index > prev_index:
+                        self.lost_rx_packets += index - (prev_index + 1)
+                    else:
+                        self.restarts = 0
+            else:
+                self.good_sequence += 1
+
+        return trunc_pkt
 
 
 # =========================================================================================================
+
 
 class FlickerThread(threading.Thread):
     """ A class to start and operate a new thread to cope with a single led flickering startup
@@ -269,17 +351,16 @@ class FlickerThread(threading.Thread):
     def run(self):
         self.start_time = millis()
         self.end_time = self.start_time + self.runtime_millis
-        print("starting Thread runtime is", self.runtime_millis / 1000, "seconds")
+        logger.info("starting Thread runtime is", self.runtime_millis / 1000, "seconds")
         self.process_data()
-        print("exiting Thread ")
+        logger.info("exiting Thread ")
 
     def process_data(self):
         while not exitFlag:
             random_limits = int(blinkOn_list[self.blinkOn_index] / 2)
             random_delta = random.randint(-1 * random_limits, random_limits)
-            time.sleep((random_delta + random_limits * 2) / 1000)
+            time.sleep((random_delta + random_limits * 2) + 0.01 / 1000)
             self.blinkOn_index += 1
-            # print("flickering")
             if self.blinkOn_index == len(blinkOn_list):
                 self.blinkOn_index = 0
 
@@ -304,8 +385,8 @@ def leds_init():
     # initialise all led outputs to output mode and to off
     global lock
     lock.acquire()
-    print("initialising leds")
-    if THIS_IS_A_PI:
+    logger.info("initialising leds")
+    if this_is_a_pi:
         GPIO.setmode(GPIO.BCM)
     for i in led_list:
         GPIO.setup(i, GPIO.OUT)
@@ -317,11 +398,10 @@ def leds_init():
 
 def leds_on():
     # Turn all leds on immediately - no flicker or any sh*t like that
-    print("***ON routine***")
+    logger.info("***ON routine***")
     global lock
     lock.acquire()
     for i in led_list:
-        # print('led on:', i)
         GPIO.output(i, GPIO.HIGH)
         # pass
     lock.release()
@@ -332,8 +412,7 @@ def leds_on_scenic():
     global power_up_order_tuple
     global power_up_delays
     global lock
-    logging.info('leds on scenic')
-    # print("leds on in scenic sequence")
+    logger.info('leds on scenic')
 
     delay_index = 0
     delay = 0
@@ -342,9 +421,8 @@ def leds_on_scenic():
         delay = power_up_delays[delay_index]
         delay_index += 1
         for led in current_tuple:
-            # iterate through the power up order tuple, and either light the led or start a flicker thread for it
+            # iterate through the power up order tuple, and either light the LED or start a flicker thread for it
             if led in flicker_leds:
-                print("flicker led", led)
 
                 athread = (FlickerThread(led_gpio=led, runtime_secs=random.randint(MIN_FLICKER_TIME, MAX_FLICKER_TIME)))
                 athread.start()
@@ -359,7 +437,7 @@ def leds_on_scenic():
 def leds_off():
     # Turn all leds off immediately (assumes that all flickering has ended)
     global lock
-    print("***OFF_routine***")
+    logger.info("***OFF_routine***")
     lock.acquire()
     for i in led_list:
         GPIO.output(i, GPIO.LOW)
@@ -372,7 +450,7 @@ def specific_led_on(led_gpio):
     global lock
     lock.acquire()
     if led_gpio in led_list:
-        # print("specific led on", led_gpio)
+        logger.info("specific led on", led_gpio)
         GPIO.output(led_gpio, GPIO.HIGH)
     lock.release()
 
@@ -382,26 +460,26 @@ def specific_led_off(led_gpio):
     global lock
     if led_gpio in led_list:
         lock.acquire()
-        # print("specific led off", led_gpio)
+        logger.info("specific led off", led_gpio)
         GPIO.output(led_gpio, GPIO.LOW)
         lock.release()
 
 
 def convert_to_gpio(h, p):
     """ given a header number (h) and a pin number (p) generate a bcm gpio pin number"""
-    print("BCM gpio is", mk2_led_list[headers_list[h - 1] + p - 1])
+    # print("BCM gpio is", mk2_led_list[headers_list[h - 1] + p - 1])
     return mk2_led_list[headers_list[h - 1] + p - 1]
 
 
 def leds_close():
     global lock
     lock.acquire()
-    print('cleanup')
+    leds_off()
     GPIO.cleanup()
     lock.release()
 
 
-def configure_board():
+def configure_board() -> bool:
     """ based on the board hostname configure the board to its known interface board version
     return a boolean to show if this has worked or not
     """
@@ -413,10 +491,10 @@ def configure_board():
 
     hostname = socket.gethostname()
 
-    if THIS_IS_A_PI:
+    if this_is_a_pi:
 
         if hostname.endswith("nth"):
-            print("its north")
+            logger.critical("+++ NORTH UNIT +++")
             headers_list = mk2_headers_start_index
             power_up_order_tuple = nth_power_up_order_tuple
             led_list = mk2_led_list
@@ -425,7 +503,7 @@ def configure_board():
 
             return True
         elif hostname.endswith('sth'):  # 'sth'"EHL01"):
-            print("its south")
+            logger.critical("+++ SOUTH UNIT +++")
             headers_list = mk1_headers_start_index
             power_up_order_tuple = sth_power_up_order_tuple
             led_list = mk1_led_list
@@ -433,60 +511,74 @@ def configure_board():
             power_up_delays = sth_power_up_delays
             return True
         else:
-            print("oh dear me - board unknown")
+            logger.critical("+++board unknown+++")
             return False
     return True
 
 
-
 def main():
-    print("Pi Zero LED controller v", VERSION)
     global lock
     global exitFlag
     global shutdown_flag
 
-    # instantiate the lock for accessing led i/o
+    # instantiate the lock for accessing led i/o - to stop the flicker thread and the main thread
+    # from both accessing LEDs at the same time
     lock = threading.Lock()
 
+    # Start the comms to the server
     my_client = ClientComms()
+
+    # configure the I/O board values depending on hostname
     if not configure_board():
         my_client.close()
-        logging.warning('Unknown Board')
         exit()
-    # configure all the led channels to output and set them all to off
+
+    # configure all the LED channels to output and set them all to off
     leds_init()
 
-    #Then configure to leds on scenic
+    # Then configure to leds on scenic
     leds_on_scenic()
-    #leds_on()
-    my_client.stay_alive()
 
+    # send the first stay alive packet
+    my_client.send_stay_alive_packet()
+
+    # This is the main loop, send stay alives and sleep until get a shutdown flay
     while True:
-        if my_client.poll_comms() or millis() - my_client.last_stay_alive_packet_time > 1000:
-            my_client.stay_alive()
 
-        time.sleep(0.2)
+        got_a_req = my_client.poll_comms()
+        if got_a_req or millis() - my_client.last_stay_alive_packet_time > STAY_ALIVE_INTERVAL_IN_MS:
+            my_client.send_stay_alive_packet()
+
+        if got_a_req:
+            time.sleep(0.05)
+        else:
+            time.sleep(0.1)
+
         if shutdown_flag:
-            print("got shutdown")
+            logger.info("got shutdown")
             break
+
+    # Turn off the comms
+    my_client.close()
+
+    # Tell the flicker thread to shutdown and wait for it to do so.
     exitFlag = True
     time.sleep(2)
-    my_client.close()
-    leds_close()
-    if shutdown_flag:
-        print("shutdown flag received")
-        if TESTING:
-            print("testing so just exit to command line")
-        elif THIS_IS_A_PI:
-            logging.info('ending in shutdown')
-            time.sleep(1)
-            print("trying to shut the pi")
-            command = "/usr/bin/sudo /sbin/shutdown -h now"
-            import subprocess
-            process = subprocess.Popen(command.split(), stdout=subprocess.PIPE)
 
-    logging.info('ending normally...')
+    # Turn off the LEDs
+    leds_close()
+
+    # if this is a PI and we aren't testing then shutdown the whole thing
+    if shutdown_flag and this_is_a_pi and not TESTING:
+        logger.info('ending in shutdown')
+        time.sleep(1)
+        command = "/usr/bin/sudo /sbin/shutdown -h now"
+        import subprocess
+        process = subprocess.Popen(command.split(), stdout=subprocess.PIPE)
+
+    logger.info('ending without shutdown...')
 
 
 if __name__ == '__main__':
+    logger.critical(f"Zero Comms Simulator {VERSION}")
     main()
